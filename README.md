@@ -150,6 +150,32 @@ contract.on("GlobalWhitelistUpdated", (token, allowed, event) => {
 contract.on("StreamerWhitelistUpdated", (streamer, token, allowed, event) => {
   console.log("Streamer whitelist updated:", streamer, token, allowed);
 });
+
+contract.on("Donation", async (donor, streamer, token, amount, fee, message, event) => {
+  console.log(`Donation received from ${donor} to ${streamer}:`, {
+    token,
+    amount: amount.toString(),
+    fee: fee.toString(),
+    message,
+    tx: event.transactionHash,
+  });
+
+  // kirim ke backend Laravel untuk disimpan di database
+  await fetch("https://your-backend/api/donation", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      donor,
+      streamer,
+      token,
+      amount: amount.toString(),
+      fee: fee.toString(),
+      message,
+      tx_hash: event.transactionHash,
+      block_number: event.blockNumber,
+    }),
+  });
+});
 ```
 
 ---
