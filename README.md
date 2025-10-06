@@ -26,6 +26,7 @@
 - 🧠 **Event-Based Integration**
   Mengirim event realtime untuk sinkronisasi backend:
   ```solidity
+  event Donation(address indexed donor, address indexed streamer, address token, uint256 amount, uint256 fee, string message);
   event GlobalWhitelistUpdated(address indexed token, bool allowed);
   event StreamerWhitelistUpdated(address indexed streamer, address indexed token, bool allowed);
   ```
