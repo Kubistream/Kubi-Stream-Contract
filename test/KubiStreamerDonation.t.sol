@@ -51,9 +51,11 @@ contract MockERC20 is IERC20 {
 // ───────────────────────────────────────────────
 contract MockFactory {
     mapping(address => mapping(address => address)) pairs;
+
     function getPair(address a, address b) external view returns (address) {
         return pairs[a][b];
     }
+
     function setPair(address a, address b, address pair) external {
         pairs[a][b] = pair;
         pairs[b][a] = pair;
@@ -63,28 +65,35 @@ contract MockFactory {
 contract MockRouter is IUniswapV2Router02 {
     address public immutable override WETH;
     MockFactory public immutable f;
+
     constructor(address _weth, address _factory) {
         WETH = _weth;
         f = MockFactory(_factory);
     }
+
     function factory() external view override returns (address) {
         return address(f);
     }
 
-    function swapExactTokensForTokens(
-        uint amountIn, uint, address[] calldata path, address to, uint
-    ) external override returns (uint[] memory amounts) {
+    function swapExactTokensForTokens(uint256 amountIn, uint256, address[] calldata path, address to, uint256)
+        external
+        override
+        returns (uint256[] memory amounts)
+    {
         IERC20(path[path.length - 1]).transfer(to, amountIn);
-        amounts = new uint[](path.length);
+        amounts = new uint256[](path.length);
         amounts[amounts.length - 1] = amountIn;
     }
 
-    function swapExactETHForTokens(
-        uint, address[] calldata, address to, uint
-    ) external payable override returns (uint[] memory amounts) {
-        amounts = new uint[](2);
+    function swapExactETHForTokens(uint256, address[] calldata, address to, uint256)
+        external
+        payable
+        override
+        returns (uint256[] memory amounts)
+    {
+        amounts = new uint256[](2);
         amounts[1] = msg.value;
-        (bool ok, ) = payable(to).call{value: msg.value}("");
+        (bool ok,) = payable(to).call{value: msg.value}("");
         require(ok, "ETH_SEND_FAIL");
     }
 }
@@ -117,14 +126,9 @@ contract KubiStreamerDonationTest is Test {
 
         // fund router with tokenB for simulated swap
         tokenB.transfer(address(router), 1_000_000 ether);
-        
+
         // deploy donation contract
-        donation = new KubiStreamerDonation(
-            address(router),
-            superAdmin,
-            250,
-            feeRecipient
-        );
+        donation = new KubiStreamerDonation(address(router), superAdmin, 250, feeRecipient);
 
         // pair tokens for swap test
         factory.setPair(address(tokenA), address(tokenB), address(0x1));
