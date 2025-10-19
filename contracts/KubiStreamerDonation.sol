@@ -105,6 +105,7 @@ contract KubiStreamerDonation is Ownable, ReentrancyGuard {
     }
 
     function donate(
+        address addressSupporter,
         address tokenIn,
         uint256 amount,
         address streamer,
@@ -120,7 +121,7 @@ contract KubiStreamerDonation is Ownable, ReentrancyGuard {
 
         if (!globalWhitelist[isETH ? address(0) : tokenIn]) revert NotInGlobalWhitelist();
 
-        if (!isETH) IERC20(tokenIn).safeTransferFrom(msg.sender, address(this), amountIn);
+        if (!isETH) IERC20(tokenIn).safeTransferFrom(addressSupporter, address(this), amountIn);
 
         uint256 feeAmt = (amountIn * feeBps) / 10_000;
         uint256 remain = amountIn - feeAmt;
@@ -137,7 +138,7 @@ contract KubiStreamerDonation is Ownable, ReentrancyGuard {
         if (streamerCfg[streamer].whitelist[isETH ? address(0) : tokenIn]) {
             if (isETH) payable(streamer).transfer(remain);
             else IERC20(tokenIn).safeTransfer(streamer, remain);
-            emit Donation(msg.sender, streamer, tokenIn, amountIn, feeAmt, tokenIn, remain, block.timestamp);
+            emit Donation(addressSupporter, streamer, tokenIn, amountIn, feeAmt, tokenIn, remain, block.timestamp);
             return;
         }
 
@@ -157,7 +158,7 @@ contract KubiStreamerDonation is Ownable, ReentrancyGuard {
                 streamer,
                 deadline
             );
-            emit Donation(msg.sender, streamer, address(0), amountIn, feeAmt, primary, amounts[1], block.timestamp);
+            emit Donation(addressSupporter, streamer, address(0), amountIn, feeAmt, primary, amounts[1], block.timestamp);
         } else {
             if (factory.getPair(tokenIn, primary) == address(0)) revert NoPairFound();
             path = new address[](2);
@@ -172,7 +173,7 @@ contract KubiStreamerDonation is Ownable, ReentrancyGuard {
                 streamer,
                 deadline
             );
-            emit Donation(msg.sender, streamer, tokenIn, amountIn, feeAmt, primary, amounts[1], block.timestamp);
+            emit Donation(addressSupporter, streamer, tokenIn, amountIn, feeAmt, primary, amounts[1], block.timestamp);
         }
     }
 
