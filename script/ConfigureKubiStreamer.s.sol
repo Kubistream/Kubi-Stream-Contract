@@ -12,7 +12,7 @@ contract ConfigureKubiStreamer is Script {
     /// -----------------------------------------------------------------------
 
     /// @notice Address of the deployed KubiStreamerDonation contract.
-    address internal constant KUBI_STREAMER = 0x0000000000000000000000000000000000000000; // TODO: replace
+    address payable internal constant KUBI_STREAMER = payable(0x0000000000000000000000000000000000000000); // TODO: replace
 
     /// @notice Tokens to (de)whitelist globally. Use address(0) for native token.
     address[] internal globalTokens = new address[](0); // e.g. push tokens in setUpWhitelist()

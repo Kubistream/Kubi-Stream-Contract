@@ -61,7 +61,8 @@ contract KubiStreamerDonation is Ownable, ReentrancyGuard {
         address primaryToken;
         mapping(address => bool) whitelist;
         mapping(address => address) yieldPreference;
-        address activeYieldUnderlying;
+        mapping(address => address) yieldContractToUnderlying;
+        address activeYieldContract;
     }
 
     struct DonationContext {
@@ -98,7 +99,7 @@ contract KubiStreamerDonation is Ownable, ReentrancyGuard {
         uint256 minDonation
     );
     event StreamerYieldUpdated(address indexed streamer, address indexed underlying, address yieldContract);
-    event StreamerActiveYieldUpdated(address indexed streamer, address indexed underlying);
+    event StreamerActiveYieldUpdated(address indexed streamer, address yieldContract, address indexed underlying);
     event YieldProcessed(
         address indexed streamer,
         address indexed yieldContract,
@@ -209,9 +210,10 @@ contract KubiStreamerDonation is Ownable, ReentrancyGuard {
 
         StreamerConfig storage streamerCfgRef = streamerCfg[streamer];
         streamerCfgRef.yieldPreference[underlying] = yieldContract;
-        if (streamerCfgRef.activeYieldUnderlying == address(0)) {
-            streamerCfgRef.activeYieldUnderlying = underlying;
-            emit StreamerActiveYieldUpdated(streamer, underlying);
+        streamerCfgRef.yieldContractToUnderlying[yieldContract] = underlying;
+        if (streamerCfgRef.activeYieldContract == address(0)) {
+            streamerCfgRef.activeYieldContract = yieldContract;
+            emit StreamerActiveYieldUpdated(streamer, yieldContract, underlying);
         }
         emit StreamerYieldUpdated(streamer, underlying, yieldContract);
     }
@@ -222,25 +224,37 @@ contract KubiStreamerDonation is Ownable, ReentrancyGuard {
         onlyStreamerOrSuper(streamer)
     {
         StreamerConfig storage cfg = streamerCfg[streamer];
+        address yieldContract = cfg.yieldPreference[underlying];
         cfg.yieldPreference[underlying] = address(0);
-        if (cfg.activeYieldUnderlying == underlying) {
-            cfg.activeYieldUnderlying = address(0);
-            emit StreamerActiveYieldUpdated(streamer, address(0));
+        if (yieldContract != address(0)) {
+            cfg.yieldContractToUnderlying[yieldContract] = address(0);
+            if (cfg.activeYieldContract == yieldContract) {
+                cfg.activeYieldContract = address(0);
+                emit StreamerActiveYieldUpdated(streamer, address(0), underlying);
+            }
         }
         emit StreamerYieldUpdated(streamer, underlying, address(0));
     }
 
-    /// @notice Selects which underlying should be used for yield processing.
-    function setStreamerActiveYield(address streamer, address underlying)
+    /// @notice Selects which yield wrapper should be prioritized for auto-yield.
+    function setStreamerActiveYield(address streamer, address yieldContract)
         external
         onlyStreamerOrSuper(streamer)
     {
         StreamerConfig storage cfg = streamerCfg[streamer];
-        if (underlying != address(0) && cfg.yieldPreference[underlying] == address(0)) {
-            revert YieldNotConfigured();
+        if (yieldContract == address(0)) {
+            cfg.activeYieldContract = address(0);
+            emit StreamerActiveYieldUpdated(streamer, address(0), address(0));
+            return;
         }
-        cfg.activeYieldUnderlying = underlying;
-        emit StreamerActiveYieldUpdated(streamer, underlying);
+
+        YieldConfig storage globalCfg = yieldCfg[yieldContract];
+        if (!globalCfg.allowed) revert YieldContractNotWhitelisted();
+        address underlying = cfg.yieldContractToUnderlying[yieldContract];
+        if (underlying == address(0)) revert YieldNotConfigured();
+
+        cfg.activeYieldContract = yieldContract;
+        emit StreamerActiveYieldUpdated(streamer, yieldContract, underlying);
     }
 
     /// @notice Updates global fee configuration with bounds checks.
@@ -258,8 +272,7 @@ contract KubiStreamerDonation is Ownable, ReentrancyGuard {
         returns (address primaryToken, address yieldContract)
     {
         StreamerConfig storage cfg = streamerCfg[streamer];
-        address primary = cfg.primaryToken;
-        return (primary, primary == address(0) ? address(0) : cfg.yieldPreference[primary]);
+        return (cfg.primaryToken, cfg.activeYieldContract);
     }
 
     /// @notice Checks whether the streamer has allowed direct receipt of a token.
@@ -276,11 +289,11 @@ contract KubiStreamerDonation is Ownable, ReentrancyGuard {
     function getStreamerActiveYield(address streamer)
         external
         view
-        returns (address underlying, address yieldContract)
+        returns (address yieldContract, address underlying)
     {
         StreamerConfig storage cfg = streamerCfg[streamer];
-        address active = cfg.activeYieldUnderlying;
-        return (active, active == address(0) ? address(0) : cfg.yieldPreference[active]);
+        address active = cfg.activeYieldContract;
+        return (active, active == address(0) ? address(0) : cfg.yieldContractToUnderlying[active]);
     }
 
     /// @notice Returns stored data for a yield wrapper.
@@ -365,28 +378,36 @@ contract KubiStreamerDonation is Ownable, ReentrancyGuard {
         view
         returns (address yieldContract, address underlying)
     {
-        address active = cfg.activeYieldUnderlying;
-        if (active != address(0)) {
-            address mappedActive = cfg.yieldPreference[active];
-            if (mappedActive != address(0)) return (mappedActive, active);
-        }
-
-        address candidate = cfg.primaryToken;
-        if (candidate != address(0)) {
-            address mapped = cfg.yieldPreference[candidate];
-            if (mapped != address(0)) return (mapped, candidate);
-        }
-
         address tokenKey = ctx.isETH ? address(0) : ctx.tokenIn;
         if (tokenKey != address(0)) {
-            address mappedToken = cfg.yieldPreference[tokenKey];
-            if (mappedToken != address(0)) return (mappedToken, tokenKey);
+            address tokenYield = cfg.yieldPreference[tokenKey];
+            if (_isYieldActive(tokenYield)) return (tokenYield, tokenKey);
         } else {
-            address mappedWeth = cfg.yieldPreference[WETH];
-            if (mappedWeth != address(0)) return (mappedWeth, WETH);
+            address nativeYield = cfg.yieldPreference[address(0)];
+            if (_isYieldActive(nativeYield)) return (nativeYield, address(0));
+            address wethYield = cfg.yieldPreference[WETH];
+            if (_isYieldActive(wethYield)) return (wethYield, WETH);
+        }
+
+        address activeYield = cfg.activeYieldContract;
+        if (_isYieldActive(activeYield)) {
+            address activeUnderlying = cfg.yieldContractToUnderlying[activeYield];
+            return (activeYield, activeUnderlying);
+        }
+
+        address candidatePrimary = cfg.primaryToken;
+        if (candidatePrimary != address(0)) {
+            address mappedPrimary = cfg.yieldPreference[candidatePrimary];
+            if (_isYieldActive(mappedPrimary)) return (mappedPrimary, candidatePrimary);
         }
 
         return (address(0), address(0));
+    }
+
+    function _isYieldActive(address yieldContract) private view returns (bool) {
+        if (yieldContract == address(0)) return false;
+        YieldConfig storage cfgLocal = yieldCfg[yieldContract];
+        return (cfgLocal.allowed && cfgLocal.underlying != address(0));
     }
 
     /// @dev Sends post-fee amount directly to the streamer in the original token.
