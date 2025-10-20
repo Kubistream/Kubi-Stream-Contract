@@ -181,7 +181,8 @@ contract KubiStreamerDonationTest is Test {
     MockERC20 tokenA; // ERC20 token
     MockERC20 tokenB; // primary token / vault underlying
     MockERC20 tokenC; // extra token
-    MockYieldToken yieldToken;
+    MockYieldToken yieldTokenB;
+    MockYieldToken yieldTokenA;
     MockRouter router;
     MockFactory factory;
     address superAdmin = address(0xAAA);
@@ -194,16 +195,19 @@ contract KubiStreamerDonationTest is Test {
         factory = new MockFactory();
         router = new MockRouter(weth, address(factory));
 
-        tokenA = new MockERC20(1_000_000 ether);
+        tokenA = new MockERC20(2_000_000 ether);
         tokenB = new MockERC20(1_000_000 ether);
         tokenC = new MockERC20(1_000_000 ether);
-        yieldToken = new MockYieldToken(IERC20(address(tokenB)));
+        yieldTokenB = new MockYieldToken(IERC20(address(tokenB)));
+        yieldTokenA = new MockYieldToken(IERC20(address(tokenA)));
 
         tokenA.approve(address(router), type(uint256).max);
-        require(tokenB.transfer(address(router), 1_000_000 ether), "FUND_ROUTER");
+        require(tokenA.transfer(address(router), 500_000 ether), "FUND_ROUTER_A");
+        require(tokenB.transfer(address(router), 1_000_000 ether), "FUND_ROUTER_B");
 
         donation = new KubiStreamerDonation(address(router), superAdmin, 250, feeRecipient);
-        yieldToken.setDepositor(address(donation));
+        yieldTokenB.setDepositor(address(donation));
+        yieldTokenA.setDepositor(address(donation));
 
         factory.setPair(address(tokenA), address(tokenB), address(0x1));
         factory.setPair(address(tokenB), address(tokenA), address(0x1));
@@ -285,8 +289,8 @@ contract KubiStreamerDonationTest is Test {
 
     function testDonateERC20_Yield() public {
         vm.startPrank(superAdmin);
-        donation.setYieldConfig(address(yieldToken), address(tokenB), address(0), true, 0);
-        donation.setStreamerYieldContract(streamer, address(yieldToken));
+        donation.setYieldConfig(address(yieldTokenB), address(tokenB), true, 0);
+        donation.setStreamerYieldContract(streamer, address(yieldTokenB));
         vm.stopPrank();
 
         vm.startPrank(donor);
@@ -294,22 +298,90 @@ contract KubiStreamerDonationTest is Test {
         donation.donate(donor, address(tokenA), 100 ether, streamer, 0, block.timestamp + 10);
         vm.stopPrank();
 
-        assertEq(yieldToken.balanceOf(streamer), 97.5 ether);
+        assertEq(yieldTokenB.balanceOf(streamer), 97.5 ether);
         assertEq(tokenA.balanceOf(feeRecipient), 2.5 ether);
-        assertEq(tokenB.balanceOf(address(yieldToken)), 97.5 ether);
+        assertEq(tokenB.balanceOf(address(yieldTokenB)), 97.5 ether);
     }
 
     function testDonateETH_Yield() public {
         vm.startPrank(superAdmin);
-        donation.setYieldConfig(address(yieldToken), address(tokenB), address(0), true, 0);
-        donation.setStreamerYieldContract(streamer, address(yieldToken));
+        donation.setYieldConfig(address(yieldTokenB), address(tokenB), true, 0);
+        donation.setStreamerYieldContract(streamer, address(yieldTokenB));
         vm.stopPrank();
 
         vm.prank(donor);
         donation.donate{value: 1 ether}(donor, address(0), 0, streamer, 0, block.timestamp + 10);
 
-        assertEq(yieldToken.balanceOf(streamer), 0.975 ether);
-        assertEq(tokenB.balanceOf(address(yieldToken)), 0.975 ether);
+        assertEq(yieldTokenB.balanceOf(streamer), 0.975 ether);
+        assertEq(tokenB.balanceOf(address(yieldTokenB)), 0.975 ether);
         assertEq(feeRecipient.balance, 0.025 ether);
+    }
+
+    function testRemoveYieldByContract() public {
+        vm.startPrank(superAdmin);
+        donation.setYieldConfig(address(yieldTokenB), address(tokenB), true, 0);
+        donation.setStreamerYieldContract(streamer, address(yieldTokenB));
+        donation.setStreamerActiveYield(streamer, address(yieldTokenB));
+        donation.removeStreamerYieldContract(streamer, address(yieldTokenB));
+        vm.stopPrank();
+
+        assertEq(donation.getStreamerYield(streamer, address(tokenB)), address(0));
+        (address activeYield,) = donation.getStreamerActiveYield(streamer);
+        assertEq(activeYield, address(0));
+    }
+
+    function testRemoveYieldRevertsWhenNotConfigured() public {
+        vm.expectRevert(abi.encodeWithSelector(YieldNotConfigured.selector));
+        vm.prank(superAdmin);
+        donation.removeStreamerYieldContract(streamer, address(yieldTokenB));
+    }
+
+    function testSetActiveYieldAndClear() public {
+        vm.startPrank(superAdmin);
+        donation.setYieldConfig(address(yieldTokenB), address(tokenB), true, 0);
+        donation.setStreamerYieldContract(streamer, address(yieldTokenB));
+        donation.setStreamerActiveYield(streamer, address(yieldTokenB));
+        vm.stopPrank();
+
+        (address activeYield, address activeUnderlying) = donation.getStreamerActiveYield(streamer);
+        assertEq(activeYield, address(yieldTokenB));
+        assertEq(activeUnderlying, address(tokenB));
+
+        vm.prank(superAdmin);
+        donation.setStreamerActiveYield(streamer, address(0));
+
+        (activeYield, activeUnderlying) = donation.getStreamerActiveYield(streamer);
+        assertEq(activeYield, address(0));
+        assertEq(activeUnderlying, address(0));
+    }
+
+    function testSetActiveYieldRevertsIfNotConfigured() public {
+        vm.expectRevert(abi.encodeWithSelector(YieldContractNotWhitelisted.selector));
+        vm.prank(superAdmin);
+        donation.setStreamerActiveYield(streamer, address(yieldTokenA));
+    }
+
+    function testDonateBelowMinSkipsYield() public {
+        vm.expectRevert(abi.encodeWithSelector(YieldNotConfigured.selector));
+        vm.prank(superAdmin);
+        donation.removeStreamerYieldContract(streamer, address(yieldTokenA));
+    }
+
+    function testDonateUsesActiveYieldFallback() public {
+        vm.startPrank(superAdmin);
+        donation.setStreamerWhitelist(streamer, address(tokenA), true);
+        donation.setPrimaryToken(streamer, address(tokenA));
+        donation.setYieldConfig(address(yieldTokenA), address(tokenA), true, 0);
+        donation.setStreamerYieldContract(streamer, address(yieldTokenA));
+        donation.setStreamerActiveYield(streamer, address(yieldTokenA));
+        vm.stopPrank();
+
+        vm.startPrank(donor);
+        tokenC.approve(address(donation), 100 ether);
+        donation.donate(donor, address(tokenC), 100 ether, streamer, 0, block.timestamp + 10);
+        vm.stopPrank();
+
+        assertEq(yieldTokenA.balanceOf(streamer), 97.5 ether);
+        assertEq(tokenA.balanceOf(address(yieldTokenA)), 97.5 ether);
     }
 }

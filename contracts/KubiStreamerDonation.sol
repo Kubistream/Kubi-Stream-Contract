@@ -52,7 +52,6 @@ contract KubiStreamerDonation is Ownable, ReentrancyGuard {
     struct YieldConfig {
         bool allowed;
         address underlying;
-        address vault;
         uint256 minDonation;
     }
     mapping(address => YieldConfig) private yieldCfg;
@@ -94,7 +93,6 @@ contract KubiStreamerDonation is Ownable, ReentrancyGuard {
     event YieldConfigUpdated(
         address indexed yieldContract,
         address indexed underlying,
-        address indexed vault,
         bool allowed,
         uint256 minDonation
     );
@@ -141,14 +139,8 @@ contract KubiStreamerDonation is Ownable, ReentrancyGuard {
         emit GlobalWhitelistUpdated(token, allowed);
     }
 
-    /// @notice Registers or removes a yield wrapper configuration (underlying + vault).
-    function setYieldConfig(
-        address yieldContract,
-        address underlying,
-        address vault,
-        bool allowed,
-        uint256 minDonation
-    )
+    /// @notice Registers or removes a yield wrapper configuration (underlying + metadata).
+    function setYieldConfig(address yieldContract, address underlying, bool allowed, uint256 minDonation)
         external
         onlyOwnerOrSuper
     {
@@ -159,18 +151,16 @@ contract KubiStreamerDonation is Ownable, ReentrancyGuard {
             yieldCfg[yieldContract] = YieldConfig({
                 allowed: true,
                 underlying: underlying,
-                vault: vault,
                 minDonation: minDonation
             });
-            emit YieldConfigUpdated(yieldContract, underlying, vault, true, minDonation);
+            emit YieldConfigUpdated(yieldContract, underlying, true, minDonation);
         } else {
             yieldCfg[yieldContract] = YieldConfig({
                 allowed: false,
                 underlying: address(0),
-                vault: address(0),
                 minDonation: 0
             });
-            emit YieldConfigUpdated(yieldContract, address(0), address(0), false, 0);
+            emit YieldConfigUpdated(yieldContract, address(0), false, 0);
         }
     }
 
@@ -218,20 +208,34 @@ contract KubiStreamerDonation is Ownable, ReentrancyGuard {
         emit StreamerYieldUpdated(streamer, underlying, yieldContract);
     }
 
-    /// @notice Removes the yield wrapper mapping for a specific underlying.
-    function removeStreamerYieldContract(address streamer, address underlying)
+    /// @notice Removes the yield wrapper mapping by yield contract address.
+    function removeStreamerYieldContract(address streamer, address yieldContract)
         external
         onlyStreamerOrSuper(streamer)
     {
         StreamerConfig storage cfg = streamerCfg[streamer];
-        address yieldContract = cfg.yieldPreference[underlying];
-        cfg.yieldPreference[underlying] = address(0);
-        if (yieldContract != address(0)) {
-            cfg.yieldContractToUnderlying[yieldContract] = address(0);
-            if (cfg.activeYieldContract == yieldContract) {
-                cfg.activeYieldContract = address(0);
-                emit StreamerActiveYieldUpdated(streamer, address(0), underlying);
+        if (yieldContract == address(0)) revert ZeroAddress();
+
+        address underlying = cfg.yieldContractToUnderlying[yieldContract];
+        bool configured;
+
+        if (underlying != address(0)) {
+            configured = (cfg.yieldPreference[underlying] == yieldContract);
+        } else {
+            if (cfg.yieldPreference[address(0)] == yieldContract) {
+                configured = true;
+                underlying = address(0);
+            } else {
+                configured = false;
             }
+        }
+        if (!configured) revert YieldNotConfigured();
+
+        cfg.yieldPreference[underlying] = address(0);
+        cfg.yieldContractToUnderlying[yieldContract] = address(0);
+        if (cfg.activeYieldContract == yieldContract) {
+            cfg.activeYieldContract = address(0);
+            emit StreamerActiveYieldUpdated(streamer, address(0), underlying);
         }
         emit StreamerYieldUpdated(streamer, underlying, address(0));
     }
@@ -300,10 +304,10 @@ contract KubiStreamerDonation is Ownable, ReentrancyGuard {
     function getYieldConfig(address yieldContract)
         external
         view
-        returns (bool allowed, address underlying, address vault, uint256 minDonation)
+        returns (bool allowed, address underlying, uint256 minDonation)
     {
         YieldConfig storage cfg = yieldCfg[yieldContract];
-        return (cfg.allowed, cfg.underlying, cfg.vault, cfg.minDonation);
+        return (cfg.allowed, cfg.underlying, cfg.minDonation);
     }
 
     /// @notice Core donation flow handling ETH/ERC20, fee distribution, swaps, and yield.
