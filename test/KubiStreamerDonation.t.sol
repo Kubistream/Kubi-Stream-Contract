@@ -5,6 +5,7 @@ import "forge-std/Test.sol";
 import "../contracts/KubiStreamerDonation.sol";
 import "../contracts/interfaces/IERC20.sol";
 import "../contracts/interfaces/IYieldWrapper.sol";
+import "../contracts/interfaces/IUniswapV3SwapRouter.sol";
 
 // ───────────────────────────────────────────────
 // Dummy token for testing
@@ -51,24 +52,24 @@ contract MockERC20 is IERC20 {
 // Mock Uniswap router (no real pricing)
 // ───────────────────────────────────────────────
 contract MockFactory {
-    mapping(address => mapping(address => address)) pairs;
+    mapping(address => mapping(address => mapping(uint24 => address))) pools;
 
-    function getPair(address a, address b) external view returns (address) {
-        return pairs[a][b];
+    function getPool(address a, address b, uint24 fee) external view returns (address) {
+        return pools[a][b][fee];
     }
 
-    function setPair(address a, address b, address pair) external {
-        pairs[a][b] = pair;
-        pairs[b][a] = pair;
+    function setPool(address a, address b, uint24 fee, address pool) external {
+        pools[a][b][fee] = pool;
+        pools[b][a][fee] = pool;
     }
 }
 
-contract MockRouter is IUniswapV2Router02 {
-    address public immutable override WETH;
+contract MockRouter is IUniswapV3SwapRouter {
+    address public immutable override WETH9;
     MockFactory public immutable f;
 
     constructor(address _weth, address _factory) {
-        WETH = _weth;
+        WETH9 = _weth;
         f = MockFactory(_factory);
     }
 
@@ -76,31 +77,26 @@ contract MockRouter is IUniswapV2Router02 {
         return address(f);
     }
 
-    function swapExactTokensForTokens(
-        uint256 amountIn,
-        uint256,
-        address[] calldata path,
-        address to,
-        uint256
-    ) external override returns (uint256[] memory amounts) {
-        require(IERC20(path[0]).transferFrom(msg.sender, address(this), amountIn), "ROUTER_PULL_FAIL");
-        require(IERC20(path[path.length - 1]).transfer(to, amountIn), "ROUTER_SEND_FAIL");
-        amounts = new uint256[](path.length);
-        amounts[0] = amountIn;
-        amounts[amounts.length - 1] = amountIn;
+    function exactInputSingle(ExactInputSingleParams calldata params)
+        external
+        payable
+        override
+        returns (uint256 amountOut)
+    {
+        if (msg.value > 0) {
+            require(params.tokenIn == WETH9, "ETH_INPUT_REQUIRES_WETH");
+            require(msg.value == params.amountIn, "MISMATCH_MSG_VALUE");
+        } else {
+            require(
+                IERC20(params.tokenIn).transferFrom(msg.sender, address(this), params.amountIn), "ROUTER_PULL_FAIL"
+            );
+        }
+
+        require(IERC20(params.tokenOut).transfer(params.recipient, params.amountIn), "ROUTER_SEND_FAIL");
+        amountOut = params.amountIn;
     }
 
-    function swapExactETHForTokens(
-        uint256,
-        address[] calldata path,
-        address to,
-        uint256
-    ) external payable override returns (uint256[] memory amounts) {
-        require(IERC20(path[path.length - 1]).transfer(to, msg.value), "ROUTER_SEND_FAIL");
-        amounts = new uint256[](path.length);
-        amounts[0] = msg.value;
-        amounts[amounts.length - 1] = msg.value;
-    }
+    receive() external payable {}
 }
 
 // ───────────────────────────────────────────────
@@ -190,6 +186,7 @@ contract KubiStreamerDonationTest is Test {
     address streamer = address(0xBEEF);
     address donor = address(0xCAFE);
     address weth = makeAddr("WETH");
+    uint24 constant POOL_FEE = 3_000;
 
     function setUp() public {
         factory = new MockFactory();
@@ -209,14 +206,10 @@ contract KubiStreamerDonationTest is Test {
         yieldTokenB.setDepositor(address(donation));
         yieldTokenA.setDepositor(address(donation));
 
-        factory.setPair(address(tokenA), address(tokenB), address(0x1));
-        factory.setPair(address(tokenB), address(tokenA), address(0x1));
-        factory.setPair(address(tokenA), weth, address(0x4));
-        factory.setPair(weth, address(tokenA), address(0x4));
-        factory.setPair(weth, address(tokenB), address(0x2));
-        factory.setPair(address(tokenB), weth, address(0x2));
-        factory.setPair(address(tokenC), address(tokenA), address(0x3));
-        factory.setPair(address(tokenA), address(tokenC), address(0x3));
+        factory.setPool(address(tokenA), address(tokenB), POOL_FEE, address(0x1));
+        factory.setPool(address(tokenB), weth, POOL_FEE, address(0x2));
+        factory.setPool(address(tokenA), weth, POOL_FEE, address(0x4));
+        factory.setPool(address(tokenC), address(tokenA), POOL_FEE, address(0x3));
 
         require(tokenA.transfer(donor, 10_000 ether), "FUND_DONOR_A");
         require(tokenC.transfer(donor, 10_000 ether), "FUND_DONOR_C");
@@ -227,6 +220,10 @@ contract KubiStreamerDonationTest is Test {
         donation.setGlobalWhitelist(address(tokenB), true);
         donation.setGlobalWhitelist(address(tokenC), true);
         donation.setGlobalWhitelist(address(0), true); // ETH
+        donation.setPoolFee(address(tokenA), address(tokenB), POOL_FEE);
+        donation.setPoolFee(address(tokenC), address(tokenA), POOL_FEE);
+        donation.setPoolFee(address(0), address(tokenB), POOL_FEE);
+        donation.setPoolFee(address(0), address(tokenA), POOL_FEE);
         vm.stopPrank();
     }
 

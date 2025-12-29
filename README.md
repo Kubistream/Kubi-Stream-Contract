@@ -9,8 +9,8 @@
 - 💸 **Donasi Langsung ke Streamer**
   Donatur mengirim token langsung ke smart contract, lalu otomatis dipotong fee platform dan dikirim ke wallet streamer.
 
-- 🔄 **Auto-Swap via Uniswap V2 Router**
-  Jika token donasi berbeda dengan token utama streamer (primary token), kontrak otomatis melakukan swap melalui router V2.
+- 🔄 **Auto-Swap via Uniswap V3 Router**
+  Jika token donasi berbeda dengan token utama streamer (primary token), kontrak otomatis melakukan swap melalui router Uniswap V3 (dengan konfigurasi fee tier).
 
 - 🧾 **Fee Platform Fleksibel**
   Super admin atau owner dapat mengatur besar fee (`feeBps`) dan penerima fee (`feeRecipient`).
@@ -26,7 +26,16 @@
 - 🧠 **Event-Based Integration**
   Mengirim event realtime untuk sinkronisasi backend:
   ```solidity
-  event Donation(address indexed donor, address indexed streamer, address token, uint256 amount, uint256 fee, string message);
+  event Donation(
+      address indexed donor,
+      address indexed streamer,
+      address indexed tokenIn,
+      uint256 amountIn,
+      uint256 feeAmount,
+      address tokenOut,
+      uint256 amountOutToStreamer,
+      uint256 timestamp
+  );
   event GlobalWhitelistUpdated(address indexed token, bool allowed);
   event StreamerWhitelistUpdated(address indexed streamer, address indexed token, bool allowed);
   ```
@@ -41,8 +50,8 @@ contracts/
 │   └── Errors.sol
 ├── interfaces/
 │   ├── IERC20.sol
-│   ├── IUniswapV2Factory.sol
-│   └── IUniswapV2Router02.sol
+│   ├── IUniswapV3Factory.sol
+│   └── IUniswapV3SwapRouter.sol
 ├── libraries/
 │   └── SafeERC20.sol
 ├── utils/
@@ -55,16 +64,23 @@ contracts/
 
 ## 🧠 Alur Donasi
 
-```
-Donatur
-   ↓ (donate(token, amount, streamer))
-Smart Contract (KubiStreamerDonation)
-   ↓
-Potong Fee → feeRecipient
-   ↓
-Kirim ke Streamer (langsung / auto-swap)
-   ↓
-Emit Event → Backend Listener (WebSocket)
+```mermaid
+flowchart LR
+    user(User) --> donor[Supporter Wallet]
+    donor -- donate(addressSupporter,\n tokenIn, amount, streamer,\n amountOutMin, deadline) --> kubiContract[Kubi Smart Contract]
+    kubiContract -->|feeBps| kubiWallet[Kubi Wallet\n(feeRecipient)]
+    kubiContract --> yieldCheck{Yield aktif\ndan amountAfterFee ≥ min?}
+    yieldCheck -- Yes --> underlying[Wrap / swap ke underlying\n(jika perlu via Uniswap V3)]
+    underlying --> yieldWrapper[Yield Wrapper\n(IYieldWrapper)]
+    yieldWrapper --> streamerYield[Streamer Wallet\n(menerima share yield)]
+    yieldCheck -- No --> whitelist{TokenIn whitelisted\noleh streamer?}
+    whitelist -- Yes --> direct[Transfer tokenIn\nlangsung ke streamer]
+    direct --> streamerDirect[Streamer Wallet]
+    whitelist -- No --> primary{Primary token\nstreamer tersedia?}
+    primary -- Yes --> swap[Swap tokenIn → primary\nvia Uniswap V3]
+    swap --> streamerSwap[Streamer Wallet]
+    primary -- No --> revertState[[Transaksi revert]]
+    streamerYield & streamerDirect & streamerSwap --> donationEvent[Emit event Donation]
 ```
 
 ---
@@ -85,14 +101,15 @@ import "../contracts/KubiStreamerDonation.sol";
 contract DeployKubiStreamer is Script {
     function run() external {
         // --- ubah sesuai kebutuhanmu ---
-        address router = 0x...;         // UniswapV2Router02 address
+        address router = 0x...;         // Uniswap V3 SwapRouter address
         address superAdmin = 0x...;     // wallet super admin
         uint16 feeBps = 250;            // 2.5%
         address feeRecipient = 0x...;   // wallet penerima fee
         // -------------------------------
 
         vm.startBroadcast();
-        new KubiStreamerDonation(router, superAdmin, feeBps, feeRecipient);
+        KubiStreamerDonation donation = new KubiStreamerDonation(router, superAdmin, feeBps, feeRecipient);
+        donation.setPoolFee(0xWETH, 0xUSDC, 3_000);  // contoh konfigurasi fee tier
         vm.stopBroadcast();
     }
 }
@@ -130,6 +147,13 @@ setPrimaryToken(streamerAddress, 0xUSDC);
 setFeeConfig(300, 0xNewFeeWallet);
 ```
 
+### Konfigurasi fee tier Uniswap V3:
+Setiap pasangan token yang butuh swap harus diset fee tier-nya (gunakan `address(0)` untuk native/WETH):
+```solidity
+setPoolFee(0xWETH, 0xUSDC, 3_000);
+setPoolFee(address(0), 0xSTREAMER_TOKEN, 3_000);
+```
+
 ---
 
 ## 🧩 Integrasi Backend (Realtime Sync)
@@ -151,14 +175,28 @@ contract.on("StreamerWhitelistUpdated", (streamer, token, allowed, event) => {
   console.log("Streamer whitelist updated:", streamer, token, allowed);
 });
 
-contract.on("Donation", async (donor, streamer, token, amount, fee, message, event) => {
-  console.log(`Donation received from ${donor} to ${streamer}:`, {
-    token,
-    amount: amount.toString(),
-    fee: fee.toString(),
-    message,
-    tx: event.transactionHash,
-  });
+contract.on(
+  "Donation",
+  async (
+    donor,
+    streamer,
+    tokenIn,
+    amountIn,
+    feeAmount,
+    tokenOut,
+    amountOut,
+    timestamp,
+    event
+  ) => {
+    console.log(`Donation received from ${donor} to ${streamer}:`, {
+      tokenIn,
+      amountIn: amountIn.toString(),
+      feeAmount: feeAmount.toString(),
+      tokenOut,
+      amountOut: amountOut.toString(),
+      timestamp: timestamp.toNumber(),
+      tx: event.transactionHash,
+    });
 
   // kirim ke backend Laravel untuk disimpan di database
   await fetch("https://your-backend/api/donation", {
@@ -167,10 +205,12 @@ contract.on("Donation", async (donor, streamer, token, amount, fee, message, eve
     body: JSON.stringify({
       donor,
       streamer,
-      token,
-      amount: amount.toString(),
-      fee: fee.toString(),
-      message,
+      tokenIn,
+      amountIn: amountIn.toString(),
+      feeAmount: feeAmount.toString(),
+      tokenOut,
+      amountOut: amountOut.toString(),
+      timestamp: timestamp.toNumber(),
       tx_hash: event.transactionHash,
       block_number: event.blockNumber,
     }),

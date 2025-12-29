@@ -16,6 +16,7 @@ error NoDirectETH();
 error SendETHFailed();
 error SendFeeFailed();
 error NoPairFound();
+error PoolFeeNotSet();
 error PathStartMismatch();
 error PathEndMismatch();
 error YieldContractNotWhitelisted();

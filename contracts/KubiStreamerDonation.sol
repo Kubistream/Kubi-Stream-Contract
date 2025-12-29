@@ -4,8 +4,8 @@ pragma solidity ^0.8.24;
 import {Ownable} from "./utils/Ownable.sol";
 import {ReentrancyGuard} from "./utils/ReentrancyGuard.sol";
 import {IERC20} from "./interfaces/IERC20.sol";
-import {IUniswapV2Router02} from "./interfaces/IUniswapV2Router02.sol";
-import {IUniswapV2Factory} from "./interfaces/IUniswapV2Factory.sol";
+import {IUniswapV3SwapRouter} from "./interfaces/IUniswapV3SwapRouter.sol";
+import {IUniswapV3Factory} from "./interfaces/IUniswapV3Factory.sol";
 import {IYieldWrapper} from "./interfaces/IYieldWrapper.sol";
 import {IWETH} from "./interfaces/IWETH.sol";
 import {SafeERC20} from "./libraries/SafeERC20.sol";
@@ -24,6 +24,7 @@ import {
     SendETHFailed,
     SendFeeFailed,
     NoPairFound,
+    PoolFeeNotSet,
     YieldContractNotWhitelisted,
     YieldUnderlyingNotInGlobal,
     YieldMintZero,
@@ -39,8 +40,8 @@ contract KubiStreamerDonation is Ownable, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
     address public superAdmin;
-    IUniswapV2Router02 public immutable router;
-    IUniswapV2Factory public immutable factory;
+    IUniswapV3SwapRouter public immutable router;
+    IUniswapV3Factory public immutable factory;
     address public immutable WETH;
 
     uint16 public feeBps;
@@ -48,6 +49,7 @@ contract KubiStreamerDonation is Ownable, ReentrancyGuard {
     address public feeRecipient;
 
     mapping(address => bool) public globalWhitelist;
+    mapping(address => mapping(address => uint24)) public poolFees;
 
     struct YieldConfig {
         bool allowed;
@@ -112,10 +114,10 @@ contract KubiStreamerDonation is Ownable, ReentrancyGuard {
         }
         if (_feeBps > MAX_FEE_BPS) revert FeeTooHigh();
 
-        IUniswapV2Router02 r = IUniswapV2Router02(_router);
+        IUniswapV3SwapRouter r = IUniswapV3SwapRouter(_router);
         router = r;
-        factory = IUniswapV2Factory(r.factory());
-        WETH = r.WETH();
+        factory = IUniswapV3Factory(r.factory());
+        WETH = r.WETH9();
         superAdmin = _superAdmin;
         feeBps = _feeBps;
         feeRecipient = _feeRecipient;
@@ -137,6 +139,15 @@ contract KubiStreamerDonation is Ownable, ReentrancyGuard {
     function setGlobalWhitelist(address token, bool allowed) external onlyOwnerOrSuper {
         globalWhitelist[token] = allowed;
         emit GlobalWhitelistUpdated(token, allowed);
+    }
+
+    /// @notice Configures the Uniswap V3 fee tier for swaps between two assets (native maps to WETH).
+    function setPoolFee(address tokenA, address tokenB, uint24 fee) external onlyOwnerOrSuper {
+        address a = tokenA == address(0) ? WETH : tokenA;
+        address b = tokenB == address(0) ? WETH : tokenB;
+        if (a == address(0) || b == address(0)) revert ZeroAddress();
+        poolFees[a][b] = fee;
+        poolFees[b][a] = fee;
     }
 
     /// @notice Registers or removes a yield wrapper configuration (underlying + metadata).
@@ -414,6 +425,53 @@ contract KubiStreamerDonation is Ownable, ReentrancyGuard {
         return (cfgLocal.allowed && cfgLocal.underlying != address(0));
     }
 
+    function _normalizeSwapToken(address token) private view returns (address) {
+        return token == address(0) ? WETH : token;
+    }
+
+    function _validatePoolConfig(address tokenIn, address tokenOut)
+        private
+        view
+        returns (address resolvedIn, address resolvedOut, uint24 fee)
+    {
+        resolvedIn = _normalizeSwapToken(tokenIn);
+        resolvedOut = _normalizeSwapToken(tokenOut);
+        fee = poolFees[resolvedIn][resolvedOut];
+        if (fee == 0) revert PoolFeeNotSet();
+        if (factory.getPool(resolvedIn, resolvedOut, fee) == address(0)) revert NoPairFound();
+    }
+
+    function _swapExactInputSingle(
+        address tokenIn,
+        address tokenOut,
+        uint256 amountIn,
+        uint256 amountOutMin,
+        address recipient,
+        uint256 deadline,
+        bool useEth
+    ) private returns (uint256 amountOut) {
+        (address resolvedIn, address resolvedOut, uint24 fee) = _validatePoolConfig(tokenIn, tokenOut);
+        IUniswapV3SwapRouter.ExactInputSingleParams memory params = IUniswapV3SwapRouter.ExactInputSingleParams({
+            tokenIn: resolvedIn,
+            tokenOut: resolvedOut,
+            fee: fee,
+            recipient: recipient,
+            deadline: deadline,
+            amountIn: amountIn,
+            amountOutMinimum: amountOutMin,
+            sqrtPriceLimitX96: 0
+        });
+
+        if (useEth) {
+            amountOut = router.exactInputSingle{value: amountIn}(params);
+        } else {
+            IERC20(resolvedIn).safeApprove(address(router), 0);
+            IERC20(resolvedIn).safeApprove(address(router), amountIn);
+            amountOut = router.exactInputSingle(params);
+            IERC20(resolvedIn).safeApprove(address(router), 0);
+        }
+    }
+
     /// @dev Sends post-fee amount directly to the streamer in the original token.
     function _directDonation(DonationContext memory ctx) private {
         if (ctx.isETH) {
@@ -434,56 +492,29 @@ contract KubiStreamerDonation is Ownable, ReentrancyGuard {
         );
     }
 
-    /// @dev Executes a two-hop swap (tokenIn/WETH -> primary token) and forwards proceeds.
+    /// @dev Executes a single-hop Uniswap V3 swap into the streamer's primary token.
     function _swapToPrimary(DonationContext memory ctx, address primaryToken) private {
-        if (ctx.isETH) {
-            if (factory.getPair(WETH, primaryToken) == address(0)) revert NoPairFound();
-            address[] memory pathEthToPrimary = new address[](2);
-            pathEthToPrimary[0] = WETH;
-            pathEthToPrimary[1] = primaryToken;
-            uint256[] memory amountsEth = router.swapExactETHForTokens{value: ctx.amountAfterFee}(
-                ctx.amountOutMin,
-                pathEthToPrimary,
-                ctx.streamer,
-                ctx.deadline
-            );
-            emit Donation(
-                ctx.donor,
-                ctx.streamer,
-                address(0),
-                ctx.amountIn,
-                ctx.feeAmt,
-                primaryToken,
-                amountsEth[amountsEth.length - 1],
-                block.timestamp
-            );
-        } else {
-            if (factory.getPair(ctx.tokenIn, primaryToken) == address(0)) revert NoPairFound();
-            address[] memory pathTokenToPrimary = new address[](2);
-            pathTokenToPrimary[0] = ctx.tokenIn;
-            pathTokenToPrimary[1] = primaryToken;
-            IERC20 tokenIn = IERC20(ctx.tokenIn);
-            tokenIn.safeApprove(address(router), 0);
-            tokenIn.safeApprove(address(router), ctx.amountAfterFee);
-            uint256[] memory amountsToken = router.swapExactTokensForTokens(
-                ctx.amountAfterFee,
-                ctx.amountOutMin,
-                pathTokenToPrimary,
-                ctx.streamer,
-                ctx.deadline
-            );
-            tokenIn.safeApprove(address(router), 0);
-            emit Donation(
-                ctx.donor,
-                ctx.streamer,
-                ctx.tokenIn,
-                ctx.amountIn,
-                ctx.feeAmt,
-                primaryToken,
-                amountsToken[amountsToken.length - 1],
-                block.timestamp
-            );
-        }
+        bool useEth = ctx.isETH;
+        address tokenIn = useEth ? address(0) : ctx.tokenIn;
+        uint256 amountOut = _swapExactInputSingle(
+            tokenIn,
+            primaryToken,
+            ctx.amountAfterFee,
+            ctx.amountOutMin,
+            ctx.streamer,
+            ctx.deadline,
+            useEth
+        );
+        emit Donation(
+            ctx.donor,
+            ctx.streamer,
+            ctx.tokenIn,
+            ctx.amountIn,
+            ctx.feeAmt,
+            primaryToken,
+            amountOut,
+            block.timestamp
+        );
     }
 
     /// @dev Converts donations into yield vault shares by acquiring underlying and depositing.
@@ -535,39 +566,30 @@ contract KubiStreamerDonation is Ownable, ReentrancyGuard {
                 IWETH(WETH).deposit{value: ctx.amountAfterFee}();
                 return ctx.amountAfterFee;
             }
-            if (factory.getPair(WETH, underlying) == address(0)) revert NoPairFound();
-            address[] memory pathEth = new address[](2);
-            pathEth[0] = WETH;
-            pathEth[1] = underlying;
-            uint256[] memory amountsEth = router.swapExactETHForTokens{value: ctx.amountAfterFee}(
+            return _swapExactInputSingle(
+                address(0),
+                underlying,
+                ctx.amountAfterFee,
                 0,
-                pathEth,
                 address(this),
-                ctx.deadline
+                ctx.deadline,
+                true
             );
-            return amountsEth[amountsEth.length - 1];
         }
 
         if (ctx.tokenIn == underlying) {
             return ctx.amountAfterFee;
         }
 
-        if (factory.getPair(ctx.tokenIn, underlying) == address(0)) revert NoPairFound();
-        address[] memory pathToken = new address[](2);
-        pathToken[0] = ctx.tokenIn;
-        pathToken[1] = underlying;
-        IERC20 tokenIn = IERC20(ctx.tokenIn);
-        tokenIn.safeApprove(address(router), 0);
-        tokenIn.safeApprove(address(router), ctx.amountAfterFee);
-        uint256[] memory amountsToken = router.swapExactTokensForTokens(
+        return _swapExactInputSingle(
+            ctx.tokenIn,
+            underlying,
             ctx.amountAfterFee,
             0,
-            pathToken,
             address(this),
-            ctx.deadline
+            ctx.deadline,
+            false
         );
-        tokenIn.safeApprove(address(router), 0);
-        return amountsToken[amountsToken.length - 1];
     }
 
     /// @notice Guard against accidental ETH transfers.

@@ -3,4 +3,10 @@ src = "src"
 out = "out"
 libs = ["lib"]
 
+[rpc_endpoints]
+mantleSepolia = "${MANTLE_RPC_URL}"
+
+[etherscan]
+mantleSepolia = { key = "${MANTLESCAN_API_KEY}", chain = 5003, url = "https://explorer.sepolia.mantle.xyz/api", browser = "https://explorer.sepolia.mantle.xyz" }
+
 # See more config options https://github.com/foundry-rs/foundry/blob/master/crates/config/README.md#all-options

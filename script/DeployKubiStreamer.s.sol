@@ -6,12 +6,13 @@ import "../contracts/KubiStreamerDonation.sol";
 
 contract DeployKubiStreamer is Script {
     function run() external {
-        // --- ubah sesuai kebutuhanmu ---
-        address router = 0x1689E7B1F10000AE47eBfE339a4f69dECd19F602;         // UniswapV2Router02 address
-        address superAdmin = 0x1234b50310fF79958509d1a9C8a92458ED1496D1;     // wallet super admin
-        uint16 feeBps = 250;            // 2.5%
-        address feeRecipient = 0x123454Ce54DEBE2cEbCe95740E9e0f65DFf9DBE2;   // wallet penerima fee
-        // -------------------------------
+        // --- isi lewat .env agar gampang pindah jaringan ---
+        address router = vm.envOr("KUBI_ROUTER", address(0));                 // contoh Mantle: 0x2bF7E65df939482869b96A6BEb88d3e5bF58Fb81
+        address superAdmin = vm.envOr("KUBI_SUPER_ADMIN", address(0));        // wallet super admin
+        uint16 feeBps = uint16(vm.envOr("KUBI_FEE_BPS", uint256(250)));       // default 2.5%
+        address feeRecipient = vm.envOr("KUBI_FEE_RECIPIENT", address(0));    // wallet penerima fee
+        require(router != address(0) && superAdmin != address(0) && feeRecipient != address(0), "Deploy: config zero");
+        // ----------------------------------------------------
 
         address[] memory whitelistTokens = new address[](11);
         whitelistTokens[0] = vm.parseAddress("0x57b78b98b9dd06e06de145b83aedf6f04e4c5500"); // WETHkb
@@ -30,6 +31,16 @@ contract DeployKubiStreamer is Script {
         address[] memory underlyingTokens = new address[](20);
         bool[] memory allowedStatuses = new bool[](20);
         uint256[] memory minDonations = new uint256[](20);
+
+        address[] memory poolTokenA = new address[](2);
+        address[] memory poolTokenB = new address[](2);
+        uint24[] memory poolFees = new uint24[](2);
+        poolTokenA[0] = whitelistTokens[0]; // WETHkb
+        poolTokenB[0] = whitelistTokens[1]; // USDCkb
+        poolFees[0] = 3_000;
+        poolTokenA[1] = whitelistTokens[0]; // WETHkb
+        poolTokenB[1] = whitelistTokens[2]; // USDTkb
+        poolFees[1] = 3_000;
 
         yieldContracts[0] = vm.parseAddress("0xAee2A87701aFEF956473d547bD02cD736729D8a7");
         underlyingTokens[0] = vm.parseAddress("0x1fE9A4E25cAA2a22FC0B61010fDB0DB462FB5b29");
@@ -135,6 +146,9 @@ contract DeployKubiStreamer is Script {
         KubiStreamerDonation donation = new KubiStreamerDonation(router, superAdmin, feeBps, feeRecipient);
         for (uint256 i = 0; i < whitelistTokens.length; ++i) {
             donation.setGlobalWhitelist(whitelistTokens[i], true);
+        }
+        for (uint256 k = 0; k < poolTokenA.length; ++k) {
+            donation.setPoolFee(poolTokenA[k], poolTokenB[k], poolFees[k]);
         }
         for (uint256 j = 0; j < yieldContracts.length; ++j) {
             donation.setYieldConfig(yieldContracts[j], underlyingTokens[j], allowedStatuses[j], minDonations[j]);
