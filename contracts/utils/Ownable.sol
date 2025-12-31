@@ -22,4 +22,11 @@ abstract contract Ownable {
         emit OwnershipTransferred(owner, newOwner);
         owner = newOwner;
     }
+
+    /// @dev Internal function to transfer ownership (for CREATE2 constructor usage)
+    function _transferOwnership(address newOwner) internal {
+        if (newOwner == address(0)) revert();
+        emit OwnershipTransferred(owner, newOwner);
+        owner = newOwner;
+    }
 }
