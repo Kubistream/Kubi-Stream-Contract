@@ -67,6 +67,10 @@ contract KubiStreamerDonation is Ownable, ReentrancyGuard, IHyperlaneRecipient {
     /// @notice Whether isHubChain has been set (one-time set flag)
     bool public isHubChainSet;
 
+    /// @notice Address of the KubiStreamerDonation contract on the hub chain
+    /// @dev Required for spoke chains to bridge donations to the correct recipient
+    address public hubContractAddress;
+
     uint16 public feeBps;
     uint16 public constant MAX_FEE_BPS = 1_000;
     address public feeRecipient;
@@ -211,6 +215,14 @@ contract KubiStreamerDonation is Ownable, ReentrancyGuard, IHyperlaneRecipient {
         require(!isHubChainSet, "isHubChain already set");
         isHubChain = _isHubChain;
         isHubChainSet = true;
+    }
+
+    /// @notice Sets the hub contract address for cross-chain bridging
+    /// @dev Required for spoke chains to know where to send bridged donations
+    /// @param _hubContractAddress Address of KubiStreamerDonation on hub chain
+    function setHubContractAddress(address _hubContractAddress) external onlyOwner {
+        require(_hubContractAddress != address(0), "Zero address");
+        hubContractAddress = _hubContractAddress;
     }
 
     /// @notice Registers or removes a yield wrapper configuration (underlying + metadata).
@@ -471,8 +483,9 @@ contract KubiStreamerDonation is Ownable, ReentrancyGuard, IHyperlaneRecipient {
         // Encode metadata: (streamer address)
         bytes memory metadata = abi.encode(streamer);
 
-        // Get recipient: this contract on hub chain
-        address recipientOnHub = address(this);
+        // Get recipient: the hub contract address (NOT address(this) since addresses differ between chains)
+        require(hubContractAddress != address(0), "Hub contract address not set");
+        address recipientOnHub = hubContractAddress;
         bytes32 recipientBytes32 = bytes32(uint256(uint160(recipientOnHub)));
 
         // Bridge using token's own transferRemoteWithMetadata function
@@ -713,22 +726,26 @@ contract KubiStreamerDonation is Ownable, ReentrancyGuard, IHyperlaneRecipient {
     /// @notice Implements IHyperlaneRecipient - called when receiving bridged donations
     /// @dev Called by HypERC20 token after minting on hub chain
     /// @param origin The domain ID of the origin chain (e.g., Base)
-    /// @param sender The address of the sender (HypERC20 token on origin chain)
-    /// @param message Encoded data: (address streamer, address token, uint256 amount)
+    /// @param sender The address of the sender (HypERC20 token on origin chain) - unused but required
+    /// @param message Encoded data: only (address streamer) - token is msg.sender (the calling token)
     function handle(
         uint32 origin,
         bytes32 sender,
         bytes calldata message
     ) external override {
+        // The caller (msg.sender) is the HypERC20 token that minted tokens to us
+        address token = msg.sender;
+        
         // Verify this is called by a whitelisted HypERC20 token
-        // Note: In production, add proper authorization check
-        // For now, we rely on the fact that only whitelisted HypERC20 tokens call this
+        if (!globalWhitelist[token]) revert NotInGlobalWhitelist();
 
-        // Decode the message: (streamer, token, amount)
-        (address streamer, address token, uint256 amount) =
-            abi.decode(message, (address, address, uint256));
+        // Decode the message: only streamer address is in customMetadata
+        address streamer = abi.decode(message, (address));
 
         if (streamer == address(0)) revert ZeroAddress();
+
+        // Get amount from balance - tokens were just minted to this contract
+        uint256 amount = IERC20(token).balanceOf(address(this));
         if (amount == 0) revert ZeroAmount();
 
         // Process the bridged donation
