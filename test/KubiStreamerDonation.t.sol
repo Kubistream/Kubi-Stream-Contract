@@ -177,7 +177,6 @@ contract KubiStreamerDonationTest is Test {
     MockERC20 tokenA; // ERC20 token
     MockERC20 tokenB; // primary token / vault underlying
     MockERC20 tokenC; // extra token
-    MockERC20 kubiToken; // Kubi token for bridging
     MockYieldToken yieldTokenB;
     MockYieldToken yieldTokenA;
     MockRouter router;
@@ -203,21 +202,7 @@ contract KubiStreamerDonationTest is Test {
         require(tokenA.transfer(address(router), 500_000 ether), "FUND_ROUTER_A");
         require(tokenB.transfer(address(router), 1_000_000 ether), "FUND_ROUTER_B");
 
-        // Deploy mock kubiToken for testing (no longer needed, kept for compatibility)
-        kubiToken = new MockERC20(1_000_000 ether);
-
-        donation = new KubiStreamerDonation(
-            address(router),
-            superAdmin,
-            250,
-            feeRecipient,
-            5001                 // hubChainId (Mantle)
-            // isHubChain removed - will be set via setIsHubChain()
-        );
-
-        // Set isHubChain after deployment
-        donation.setIsHubChain(true); // Testing on hub chain
-
+        donation = new KubiStreamerDonation(address(router), superAdmin, 250, feeRecipient);
         yieldTokenB.setDepositor(address(donation));
         yieldTokenA.setDepositor(address(donation));
 
