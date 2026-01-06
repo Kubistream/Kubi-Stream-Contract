@@ -49,8 +49,8 @@ contract KubiStreamerDonation is Ownable, ReentrancyGuard, IHyperlaneRecipient {
     using SafeERC20 for IERC20;
 
     address public superAdmin;
-    IUniswapV3SwapRouter public immutable router;
-    IUniswapV3Factory public immutable factory;
+    IUniswapV3SwapRouter public router;
+    IUniswapV3Factory public factory;
     address public immutable WETH;
 
     uint16 public feeBps;
@@ -139,6 +139,7 @@ contract KubiStreamerDonation is Ownable, ReentrancyGuard, IHyperlaneRecipient {
         uint256 timestamp
     );
     event GlobalWhitelistUpdated(address indexed token, bool allowed);
+    event SwapRouterUpdated(address indexed oldRouter, address indexed newRouter);
     event StreamerWhitelistUpdated(address indexed streamer, address indexed token, bool allowed);
     event YieldConfigUpdated(
         address indexed yieldContract,
@@ -234,6 +235,17 @@ contract KubiStreamerDonation is Ownable, ReentrancyGuard, IHyperlaneRecipient {
     function setGlobalWhitelist(address token, bool allowed) external onlyOwnerOrSuper {
         globalWhitelist[token] = allowed;
         emit GlobalWhitelistUpdated(token, allowed);
+    }
+
+    /// @notice Updates the swap router address (admin only)
+    /// @dev Also updates factory from the new router
+    function setSwapRouter(address _router) external onlyOwnerOrSuper {
+        if (_router == address(0)) revert ZeroAddress();
+        address oldRouter = address(router);
+        IUniswapV3SwapRouter r = IUniswapV3SwapRouter(_router);
+        router = r;
+        factory = IUniswapV3Factory(r.factory());
+        emit SwapRouterUpdated(oldRouter, _router);
     }
 
     /// @notice Configures the Uniswap V3 fee tier for swaps between two assets (native maps to WETH).
