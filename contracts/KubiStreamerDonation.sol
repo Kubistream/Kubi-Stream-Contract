@@ -8,6 +8,8 @@ import {IUniswapV3SwapRouter} from "./interfaces/IUniswapV3SwapRouter.sol";
 import {IUniswapV3Factory} from "./interfaces/IUniswapV3Factory.sol";
 import {IYieldWrapper} from "./interfaces/IYieldWrapper.sol";
 import {IWETH} from "./interfaces/IWETH.sol";
+import {IHyperlaneRecipient} from "./interfaces/IHyperlaneRecipient.sol";
+import {ITokenHypERC20} from "./interfaces/ITokenHypERC20.sol";
 import {SafeERC20} from "./libraries/SafeERC20.sol";
 import {
     ZeroAddress,
@@ -31,12 +33,19 @@ import {
     YieldUnderlyingZero,
     YieldMintBelowMin,
     YieldUnderlyingMismatch,
-    YieldNotConfigured
+    YieldNotConfigured,
+    UntrustedRemoteToken,
+    MessageAlreadyProcessed,
+    InvalidMessageFormat,
+    PendingDonationNotFound,
+    PendingDonationAlreadyClaimed,
+    OnlyDonorOrStreamer
 } from "./errors/Errors.sol";
 
 /// @title Kubi Streamer Donation
 /// @notice Unified donation contract supporting native & ERC20 with optional auto-yield conversion
-contract KubiStreamerDonation is Ownable, ReentrancyGuard {
+/// @dev Supports cross-chain donations via Hyperlane IHyperlaneRecipient interface
+contract KubiStreamerDonation is Ownable, ReentrancyGuard, IHyperlaneRecipient {
     using SafeERC20 for IERC20;
 
     address public superAdmin;
@@ -57,6 +66,45 @@ contract KubiStreamerDonation is Ownable, ReentrancyGuard {
         uint256 minDonation;
     }
     mapping(address => YieldConfig) private yieldCfg;
+
+    // ═══════════════════════════════════════════════════════════
+    // CROSS-CHAIN STORAGE
+    // ═══════════════════════════════════════════════════════════
+    
+    /// @notice Tracking pesan yang sudah diproses untuk replay protection
+    mapping(bytes32 => bool) public processedMessages;
+    
+    /// @notice Registry token yang dipercaya dari chain lain
+    /// @dev chainId => tokenAddress => trusted
+    mapping(uint32 => mapping(address => bool)) public trustedRemoteTokens;
+    
+    /// @notice Pending donation untuk donasi yang gagal diproses
+    struct PendingDonation {
+        address donor;
+        address streamer;
+        address token;
+        uint256 amount;
+        uint32 originChain;
+        bool claimed;
+    }
+    mapping(bytes32 => PendingDonation) public pendingDonations;
+
+    // ═══════════════════════════════════════════════════════════
+    // HUB CHAIN BRIDGING CONFIG
+    // ═══════════════════════════════════════════════════════════
+    
+    /// @notice Whether this contract is deployed on the hub chain
+    bool public isHubChain;
+    
+    /// @notice Domain ID of the hub chain (e.g., 5003 for Mantle Sepolia)
+    uint32 public hubChainDomainId;
+    
+    /// @notice Address of KubiStreamerDonation contract on the hub chain
+    address public hubContractAddress;
+    
+    /// @notice Mapping from local token address to its Hyperlane-enabled version
+    /// @dev tokenAddress => hypERC20Address for bridging
+    mapping(address => address) public tokenToHypToken;
 
     struct StreamerConfig {
         address primaryToken;
@@ -107,6 +155,53 @@ contract KubiStreamerDonation is Ownable, ReentrancyGuard {
         uint256 underlyingAmount,
         uint256 mintedAmount
     );
+    
+    event DonationBridged(
+        address indexed donor,
+        address indexed streamer,
+        uint32 indexed destinationChain,
+        address tokenBridged,
+        uint256 amount,
+        bytes32 messageId
+    );
+
+    // ═══════════════════════════════════════════════════════════
+    // CROSS-CHAIN EVENTS
+    // ═══════════════════════════════════════════════════════════
+    
+    event BridgedDonationReceived(
+        uint32 indexed originChain,
+        address indexed donor,
+        address indexed streamer,
+        address token,
+        uint256 amount,
+        bytes32 messageId
+    );
+    
+    event BridgedDonationProcessed(
+        bytes32 indexed messageId,
+        address indexed streamer,
+        address tokenOut,
+        uint256 amountOut,
+        bool success
+    );
+    
+    event TrustedTokenUpdated(uint32 indexed chainId, address indexed token, bool trusted);
+    
+    event DonationPending(
+        bytes32 indexed messageId,
+        address indexed donor,
+        address indexed streamer,
+        address token,
+        uint256 amount
+    );
+    
+    event PendingDonationClaimed(
+        bytes32 indexed messageId,
+        address indexed claimer,
+        address token,
+        uint256 amount
+    );
 
     constructor(address _router, address _superAdmin, uint16 _feeBps, address _feeRecipient) {
         if (_router == address(0) || _superAdmin == address(0) || _feeRecipient == address(0)) {
@@ -148,6 +243,31 @@ contract KubiStreamerDonation is Ownable, ReentrancyGuard {
         if (a == address(0) || b == address(0)) revert ZeroAddress();
         poolFees[a][b] = fee;
         poolFees[b][a] = fee;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // HUB CHAIN CONFIG SETTERS
+    // ═══════════════════════════════════════════════════════════
+
+    /// @notice Sets whether this contract is deployed on the hub chain
+    function setIsHubChain(bool _isHub) external onlyOwnerOrSuper {
+        isHubChain = _isHub;
+    }
+
+    /// @notice Sets the hub chain domain ID (used for Hyperlane routing)
+    function setHubChainDomainId(uint32 _domainId) external onlyOwnerOrSuper {
+        hubChainDomainId = _domainId;
+    }
+
+    /// @notice Sets the KubiStreamerDonation contract address on the hub chain
+    function setHubContractAddress(address _hubContract) external onlyOwnerOrSuper {
+        if (_hubContract == address(0)) revert ZeroAddress();
+        hubContractAddress = _hubContract;
+    }
+
+    /// @notice Maps a local token to its Hyperlane-enabled version for bridging
+    function setTokenToHypToken(address token, address hypToken) external onlyOwnerOrSuper {
+        tokenToHypToken[token] = hypToken;
     }
 
     /// @notice Registers or removes a yield wrapper configuration (underlying + metadata).
@@ -350,6 +470,17 @@ contract KubiStreamerDonation is Ownable, ReentrancyGuard {
                 if (!okFee) revert SendFeeFailed();
             } else {
                 IERC20(tokenIn).safeTransfer(feeRecipient, feeAmt);
+            }
+        }
+
+        // ═══════════════════════════════════════════════════════════
+        // CROSS-CHAIN BRIDGING: If not hub chain, bridge to hub
+        // ═══════════════════════════════════════════════════════════
+        if (!isHubChain && !isETH) {
+            address hypToken = tokenToHypToken[tokenIn];
+            if (hypToken != address(0) && hubContractAddress != address(0)) {
+                _bridgeToHub(addressSupporter, tokenIn, amountAfterFee, streamer, hypToken);
+                return;
             }
         }
 
@@ -590,6 +721,239 @@ contract KubiStreamerDonation is Ownable, ReentrancyGuard {
             ctx.deadline,
             false
         );
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // CROSS-CHAIN FUNCTIONS
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// @notice Handler untuk menerima donasi cross-chain via Hyperlane
+    /// @dev Dipanggil oleh TokenHypERC20 setelah minting token di chain ini
+    /// @param _origin Chain ID asal donasi
+    /// @param _sender Alamat pengirim (TokenHypERC20 di chain asal) dalam bytes32
+    /// @param _message Data encoded: (address donor, address streamer, address token, uint256 amount)
+    function handle(
+        uint32 _origin,
+        bytes32 _sender,
+        bytes calldata _message
+    ) external override nonReentrant {
+        // Decode sender address
+        address senderAddress = address(uint160(uint256(_sender)));
+        
+        // Validate sender is a trusted remote token
+        // if (!trustedRemoteTokens[_origin][senderAddress]) {
+        //     revert UntrustedRemoteToken();
+        // }
+        
+        // Generate unique message ID for replay protection
+        bytes32 messageId = keccak256(abi.encodePacked(_origin, _sender, _message, block.number));
+        
+        // Check replay protection
+        if (processedMessages[messageId]) {
+            revert MessageAlreadyProcessed();
+        }
+        processedMessages[messageId] = true;
+        
+        // Decode message payload
+        // Format: abi.encode(donor, streamer, token, amount)
+        if (_message.length < 128) {
+            revert InvalidMessageFormat();
+        }
+        
+        (address donor, address streamer, address token, uint256 amount) = 
+            abi.decode(_message, (address, address, address, uint256));
+        
+        // Validate basic params
+        if (streamer == address(0)) revert ZeroAddress();
+        if (amount == 0) revert ZeroAmount();
+        if (!globalWhitelist[token]) revert NotInGlobalWhitelist();
+        
+        emit BridgedDonationReceived(_origin, donor, streamer, token, amount, messageId);
+        
+        // Try to process the donation
+        bool success = _processBridgedDonation(donor, streamer, token, amount, messageId);
+        
+        if (!success) {
+            // Store as pending donation for later claim
+            pendingDonations[messageId] = PendingDonation({
+                donor: donor,
+                streamer: streamer,
+                token: token,
+                amount: amount,
+                originChain: _origin,
+                claimed: false
+            });
+            emit DonationPending(messageId, donor, streamer, token, amount);
+        }
+    }
+    
+    /// @notice Internal function to process bridged donation
+    /// @dev Attempts to process via yield, direct, or swap based on streamer config
+    function _processBridgedDonation(
+        address donor,
+        address streamer,
+        address token,
+        uint256 amount,
+        bytes32 messageId
+    ) private returns (bool success) {
+        StreamerConfig storage cfg = streamerCfg[streamer];
+        
+        // Create donation context (no fee deducted for bridged - fee was taken on origin chain)
+        DonationContext memory ctx = DonationContext({
+            donor: donor,
+            tokenIn: token,
+            amountIn: amount,
+            feeAmt: 0, // Fee already deducted on origin chain
+            amountAfterFee: amount,
+            streamer: streamer,
+            amountOutMin: 0,
+            deadline: block.timestamp + 1 hours,
+            isETH: false
+        });
+        
+        // Try yield first
+        (address yieldContract, address yieldUnderlying) = _resolveYield(cfg, ctx);
+        if (yieldContract != address(0)) {
+            YieldConfig memory yCfg = yieldCfg[yieldContract];
+            if (ctx.amountAfterFee >= yCfg.minDonation) {
+                try this.processBridgedYieldDonation(ctx, yieldContract, yieldUnderlying, messageId) {
+                    return true;
+                } catch {
+                    // Fall through to other options
+                }
+            }
+        }
+        
+        // Try direct transfer if token is in streamer whitelist
+        if (cfg.whitelist[token]) {
+            try this.processBridgedDirectDonation(ctx, messageId) {
+                return true;
+            } catch {
+                return false;
+            }
+        }
+        
+        // Try swap to primary token
+        address primary = cfg.primaryToken;
+        if (primary != address(0) && globalWhitelist[primary]) {
+            try this.processBridgedSwapDonation(ctx, primary, messageId) {
+                return true;
+            } catch {
+                return false;
+            }
+        }
+        
+        // If no processing option available, send directly to streamer
+        IERC20(token).safeTransfer(streamer, amount);
+        emit BridgedDonationProcessed(messageId, streamer, token, amount, true);
+        emit Donation(donor, streamer, token, amount, 0, token, amount, block.timestamp);
+        return true;
+    }
+    
+    /// @notice Process bridged donation as yield (external for try/catch)
+    function processBridgedYieldDonation(
+        DonationContext memory ctx,
+        address yieldContract,
+        address yieldUnderlying,
+        bytes32 messageId
+    ) external {
+        require(msg.sender == address(this), "Only self");
+        _processYieldDonation(ctx, yieldContract, yieldUnderlying);
+        emit BridgedDonationProcessed(messageId, ctx.streamer, yieldContract, ctx.amountAfterFee, true);
+    }
+    
+    /// @notice Process bridged donation as direct transfer (external for try/catch)
+    function processBridgedDirectDonation(
+        DonationContext memory ctx,
+        bytes32 messageId
+    ) external {
+        require(msg.sender == address(this), "Only self");
+        _directDonation(ctx);
+        emit BridgedDonationProcessed(messageId, ctx.streamer, ctx.tokenIn, ctx.amountAfterFee, true);
+    }
+    
+    /// @notice Process bridged donation with swap (external for try/catch)
+    function processBridgedSwapDonation(
+        DonationContext memory ctx,
+        address primaryToken,
+        bytes32 messageId
+    ) external {
+        require(msg.sender == address(this), "Only self");
+        _swapToPrimary(ctx, primaryToken);
+        emit BridgedDonationProcessed(messageId, ctx.streamer, primaryToken, ctx.amountAfterFee, true);
+    }
+    
+    /// @notice Set trusted remote token for cross-chain donations
+    /// @param chainId Chain ID where the token resides
+    /// @param token Token address on the remote chain
+    /// @param trusted Whether to trust this token
+    function setTrustedRemoteToken(
+        uint32 chainId,
+        address token,
+        bool trusted
+    ) external onlyOwnerOrSuper {
+        if (token == address(0)) revert ZeroAddress();
+        trustedRemoteTokens[chainId][token] = trusted;
+        emit TrustedTokenUpdated(chainId, token, trusted);
+    }
+    
+    /// @notice Claim a pending donation that failed to process
+    /// @param messageId The ID of the pending donation
+    function claimPendingDonation(bytes32 messageId) external nonReentrant {
+        PendingDonation storage pending = pendingDonations[messageId];
+        
+        if (pending.amount == 0) revert PendingDonationNotFound();
+        if (pending.claimed) revert PendingDonationAlreadyClaimed();
+        
+        // Only donor or streamer can claim
+        if (msg.sender != pending.donor && msg.sender != pending.streamer) {
+            revert OnlyDonorOrStreamer();
+        }
+        
+        pending.claimed = true;
+        
+        // Transfer to claimer
+        IERC20(pending.token).safeTransfer(msg.sender, pending.amount);
+        
+        emit PendingDonationClaimed(messageId, msg.sender, pending.token, pending.amount);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // CROSS-CHAIN BRIDGING (OUTBOUND)
+    // ═══════════════════════════════════════════════════════════
+
+    /// @notice Internal function to bridge donation to hub chain
+    /// @param donor Address of the donor
+    /// @param token Local token being donated
+    /// @param amount Amount after fee deduction
+    /// @param streamer Target streamer address
+    /// @param hypToken Hyperlane-enabled token address
+    function _bridgeToHub(
+        address donor,
+        address token,
+        uint256 amount,
+        address streamer,
+        address hypToken
+    ) internal {
+        // Approve hypToken to spend the local token
+        IERC20(token).safeApprove(hypToken, amount);
+
+        // Encode metadata for the hub chain to process
+        // Format: (donor, streamer, originalToken)
+        bytes memory metadata = abi.encode(donor, streamer, token, amount);
+
+        // Convert hub contract address to bytes32
+        bytes32 recipient = bytes32(uint256(uint160(hubContractAddress)));
+
+        // Call transferRemoteWithMetadata on the HypERC20 token
+        bytes32 messageId = ITokenHypERC20(hypToken).transferRemoteWithMetadata(
+            hubChainDomainId,
+            recipient,
+            amount,
+            metadata
+        );
+
+        emit DonationBridged(donor, streamer, hubChainDomainId, token, amount, messageId);
     }
 
     /// @notice Guard against accidental ETH transfers.

@@ -26,3 +26,12 @@ error YieldUnderlyingZero();
 error YieldMintBelowMin();
 error YieldUnderlyingMismatch();
 error YieldNotConfigured();
+
+// Cross-chain errors
+error UntrustedRemoteToken();
+error MessageAlreadyProcessed();
+error InvalidMessageFormat();
+error PendingDonationNotFound();
+error PendingDonationAlreadyClaimed();
+error OnlyDonorOrStreamer();
+
