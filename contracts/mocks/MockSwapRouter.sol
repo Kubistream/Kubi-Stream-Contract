@@ -7,7 +7,7 @@ import "../utils/Ownable.sol";
 
 /// @title MockSwapRouter
 /// @notice Mock Uniswap V3 SwapRouter untuk testing di testnet
-/// @dev Implement IUniswapV3SwapRouter interface dan langsung transfer token 1:1
+/// @dev Implement IUniswapV3SwapRouter interface dengan configurable exchange rates
 ///      Hanya untuk testing - JANGAN GUNAKAN DI PRODUCTION!
 contract MockSwapRouter is Ownable {
     using SafeERC20 for IERC20;
@@ -17,6 +17,11 @@ contract MockSwapRouter is Ownable {
 
     // Mapping untuk token yang bisa di-swap
     mapping(address => mapping(address => bool)) public swapEnabled;
+    
+    // Exchange rate: tokenIn => tokenOut => rate (in basis points, 10000 = 1:1)
+    // Contoh: rate 5000 berarti 1 tokenIn = 0.5 tokenOut
+    // Contoh: rate 20000 berarti 1 tokenIn = 2 tokenOut
+    mapping(address => mapping(address => uint256)) public exchangeRates;
 
     event SwapExecuted(
         address indexed tokenIn,
@@ -24,6 +29,12 @@ contract MockSwapRouter is Ownable {
         uint256 amountIn,
         uint256 amountOut,
         address recipient
+    );
+    
+    event ExchangeRateUpdated(
+        address indexed tokenIn,
+        address indexed tokenOut,
+        uint256 rate
     );
 
     error SwapNotEnabled();
@@ -50,8 +61,47 @@ contract MockSwapRouter is Ownable {
         swapEnabled[tokenA][tokenB] = enabled;
         swapEnabled[tokenB][tokenA] = enabled;
     }
+    
+    /// @notice Set exchange rate untuk token pair
+    /// @param tokenIn Token yang di-input
+    /// @param tokenOut Token yang di-output
+    /// @param rate Rate dalam basis points (10000 = 1:1, 5000 = 0.5:1, 20000 = 2:1)
+    /// @dev Contoh: AXL -> ETH dengan rate 500 berarti 1 AXL = 0.05 ETH
+    function setExchangeRate(address tokenIn, address tokenOut, uint256 rate) external onlyOwner {
+        exchangeRates[tokenIn][tokenOut] = rate;
+        emit ExchangeRateUpdated(tokenIn, tokenOut, rate);
+    }
+    
+    /// @notice Set exchange rate dua arah sekaligus
+    /// @param tokenA First token
+    /// @param tokenB Second token  
+    /// @param rateAtoB Rate dari A ke B (basis points)
+    /// @param rateBtoA Rate dari B ke A (basis points)
+    function setExchangeRateBidirectional(
+        address tokenA, 
+        address tokenB, 
+        uint256 rateAtoB, 
+        uint256 rateBtoA
+    ) external onlyOwner {
+        exchangeRates[tokenA][tokenB] = rateAtoB;
+        exchangeRates[tokenB][tokenA] = rateBtoA;
+        emit ExchangeRateUpdated(tokenA, tokenB, rateAtoB);
+        emit ExchangeRateUpdated(tokenB, tokenA, rateBtoA);
+    }
+    
+    /// @notice Get exchange rate, returns 10000 (1:1) if not set
+    function getExchangeRate(address tokenIn, address tokenOut) public view returns (uint256) {
+        uint256 rate = exchangeRates[tokenIn][tokenOut];
+        return rate == 0 ? 10000 : rate; // Default 1:1
+    }
+    
+    /// @notice Calculate output amount based on exchange rate
+    function getAmountOut(address tokenIn, address tokenOut, uint256 amountIn) public view returns (uint256) {
+        uint256 rate = getExchangeRate(tokenIn, tokenOut);
+        return (amountIn * rate) / 10000;
+    }
 
-    /// @notice Mock exactInputSingle - transfer 1:1 untuk testing
+    /// @notice Mock exactInputSingle dengan configurable exchange rate
     /// @dev Caller harus approve tokenIn ke MockSwapRouter sebelum call
     function exactInputSingle(ExactInputSingleParams calldata params) 
         external 
@@ -67,8 +117,8 @@ contract MockSwapRouter is Ownable {
         // Transfer tokenIn dari caller ke router
         IERC20(params.tokenIn).safeTransferFrom(msg.sender, address(this), params.amountIn);
 
-        // Mock: amountOut = amountIn (1:1 ratio untuk testing)
-        amountOut = params.amountIn;
+        // Calculate amountOut based on exchange rate
+        amountOut = getAmountOut(params.tokenIn, params.tokenOut, params.amountIn);
 
         if (amountOut < params.amountOutMinimum) {
             revert InsufficientOutputAmount();
